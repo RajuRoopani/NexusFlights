@@ -1,0 +1,20 @@
+name: flightvision2030
+services:
+  web:
+    project: .
+    language: js
+    host: containerapp
+    env:
+      - AZURE_OPENAI_ENDPOINT
+      - AZURE_OPENAI_KEY
+      - COSMOS_DB_ENDPOINT
+      - REDIS_CONNECTION_STRING
+  
+  database:
+    type: cosmos.nosql
+    
+  cache:
+    type: redis
+    
+  ai:
+    type: ai.openai.account
