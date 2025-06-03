@@ -35,7 +35,7 @@ function FlightPath() {
     new THREE.Vector3(2, 0, 0)
   ]
 
-  const lineRef = useRef<THREE.Line>(null)
+  const lineRef = useRef<any>(null)
 
   useFrame((state) => {
     if (lineRef.current) {

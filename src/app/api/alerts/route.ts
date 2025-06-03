@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { databaseService } from '@/services/databaseService'
+import databaseService from '@/services/databaseService'
 import { aiService } from '@/services/aiService'
 
 // GET /api/alerts - Get price alerts for user

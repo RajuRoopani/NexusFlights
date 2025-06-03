@@ -207,6 +207,22 @@ export interface SearchResponse {
   };
 }
 
+// Flight search parameters for external APIs
+export interface FlightSearchParams {
+  origin: string;
+  destination: string;
+  departure_date: string;
+  return_date?: string;
+  adults: number;
+  children?: number;
+  infants?: number;
+  cabin_class?: 'economy' | 'premium_economy' | 'business' | 'first';
+  non_stop?: boolean;
+  max_price?: number;
+  currency?: string;
+  max_results?: number;
+}
+
 // Real-time data types
 export interface FlightStatus {
   flight_id: string;

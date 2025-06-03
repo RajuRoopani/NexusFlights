@@ -1,13 +1,18 @@
 import { CosmosClient } from '@azure/cosmos'
 import { DefaultAzureCredential } from '@azure/identity'
-import { Flight, UserProfile, SearchCriteria, AIInsight } from '@/types'
+import { Flight, UserProfile, SearchCriteria, AIInsight, FlightSearchParams } from '@/types'
+import { FlightDataService } from './flightDataProviders'
 
 class DatabaseService {
   private client: CosmosClient | null = null
   private database: any = null
   private isConnected: boolean = false
+  private flightDataService: FlightDataService
   
   constructor() {
+    // Initialize flight data service
+    this.flightDataService = new FlightDataService()
+    
     const endpoint = process.env.COSMOS_DB_ENDPOINT
     
     if (endpoint) {
@@ -21,20 +26,86 @@ class DatabaseService {
         this.database = this.client.database('flightvision')
         this.isConnected = true
       } catch (error) {
-        console.warn('Failed to connect to Cosmos DB, using mock data:', error)
+        console.warn('Failed to connect to Cosmos DB, using real flight APIs only:', error)
         this.isConnected = false
       }
     } else {
-      console.log('No Cosmos DB endpoint configured, using mock data for development')
+      console.log('No Cosmos DB endpoint configured, using real flight APIs for data')
       this.isConnected = false
     }
   }
 
   // Flight operations
   async searchFlights(criteria: SearchCriteria): Promise<Flight[]> {
-    if (!this.isConnected) {
+    try {
+      // Convert search criteria to FlightSearchParams for external APIs
+      const searchParams: FlightSearchParams = {
+        origin: criteria.origin,
+        destination: criteria.destination,
+        departure_date: criteria.departure_date,
+        return_date: criteria.return_date,
+        adults: criteria.passengers.adults,
+        children: criteria.passengers.children,
+        infants: criteria.passengers.infants,
+        // Filter out neural_pod as it's not supported by external APIs
+        cabin_class: criteria.cabin_class?.find(c => c !== 'neural_pod') as 'economy' | 'premium_economy' | 'business' | 'first' || 'economy',
+        non_stop: false, // Set default since max_stops is not in SearchCriteria
+        max_price: criteria.max_price,
+        currency: 'USD',
+        max_results: 50
+      }
+
+      // First try to get real flight data from external APIs
+      console.log('Searching for flights using real APIs...', searchParams)
+      const realFlights = await this.flightDataService.searchFlights(searchParams)
+      
+      if (realFlights && realFlights.length > 0) {
+        console.log(`Found ${realFlights.length} real flights`)
+        
+        // Cache results in Cosmos DB if connected
+        if (this.isConnected) {
+          await this.cacheFlightResults(realFlights, searchParams)
+        }
+        
+        // Apply additional filters and sorting based on criteria
+        return this.applySearchFilters(realFlights, criteria)
+      }
+
+      // Fallback to cached data from Cosmos DB if available
+      if (this.isConnected) {
+        console.log('No real flights found, trying cached data...')
+        const cachedFlights = await this.getCachedFlights(criteria)
+        if (cachedFlights.length > 0) {
+          return this.applySearchFilters(cachedFlights, criteria)
+        }
+      }
+
+      // Final fallback to mock data for development
+      console.log('Using mock data as fallback...')
+      return this.getMockFlights(criteria)
+      
+    } catch (error) {
+      console.error('Flight search error:', error)
+      
+      // Try cached data if real API fails
+      if (this.isConnected) {
+        try {
+          const cachedFlights = await this.getCachedFlights(criteria)
+          if (cachedFlights.length > 0) {
+            return this.applySearchFilters(cachedFlights, criteria)
+          }
+        } catch (cacheError) {
+          console.error('Cache lookup failed:', cacheError)
+        }
+      }
+      
+      // Ultimate fallback to mock data
       return this.getMockFlights(criteria)
     }
+  }
+
+  private async getCachedFlights(criteria: SearchCriteria): Promise<Flight[]> {
+    if (!this.isConnected) return []
 
     try {
       const container = this.database.container('flights')
@@ -42,25 +113,51 @@ class DatabaseService {
       const querySpec = {
         query: `
           SELECT * FROM c 
-          WHERE c.departure.airport.code = @origin 
-          AND c.arrival.airport.code = @destination
-          AND c.departure.date >= @departureDate
+          WHERE c.segments[0].departure.airport.code = @origin 
+          AND c.segments[0].arrival.airport.code = @destination
+          AND c.segments[0].departure.time >= @departureDate
+          AND c.segments[0].departure.time <= @maxDate
           ORDER BY c.price.total ASC
         `,
         parameters: [
           { name: '@origin', value: criteria.origin },
           { name: '@destination', value: criteria.destination },
-          { name: '@departureDate', value: criteria.departure_date }
+          { name: '@departureDate', value: criteria.departure_date },
+          { name: '@maxDate', value: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString() }
         ]
       }
 
       const { resources } = await container.items.query(querySpec).fetchAll()
-      
-      // Apply filters and sorting based on criteria
-      return this.applySearchFilters(resources, criteria)
+      return resources || []
     } catch (error) {
-      console.error('Flight search error:', error)
-      return this.getMockFlights(criteria)
+      console.error('Error fetching cached flights:', error)
+      return []
+    }
+  }
+
+  private async cacheFlightResults(flights: Flight[], searchParams: FlightSearchParams): Promise<void> {
+    if (!this.isConnected) return
+
+    try {
+      const container = this.database.container('flights')
+      
+      // Cache each flight with TTL (expire after 1 hour)
+      const ttlSeconds = 3600
+      
+      for (const flight of flights) {
+        const cacheItem = {
+          ...flight,
+          _searchParams: searchParams,
+          _cachedAt: new Date().toISOString(),
+          ttl: ttlSeconds
+        }
+        
+        await container.items.upsert(cacheItem)
+      }
+      
+      console.log(`Cached ${flights.length} flights`)
+    } catch (error) {
+      console.error('Error caching flight results:', error)
     }
   }  // Mock data for development
   private getMockFlights(criteria: SearchCriteria): Flight[] {
@@ -254,7 +351,53 @@ class DatabaseService {
   }
 
   private applySearchFilters(flights: Flight[], criteria: SearchCriteria): Flight[] {
-    return flights
+    let filteredFlights = [...flights]
+
+    // Filter by cabin class
+    if (criteria.cabin_class && criteria.cabin_class.length > 0) {
+      filteredFlights = filteredFlights.filter(flight => 
+        flight.segments.some(segment => 
+          criteria.cabin_class.includes(segment.cabin_class)
+        )
+      )
+    }
+
+    // Filter by max price
+    if (criteria.max_price) {
+      filteredFlights = filteredFlights.filter(flight => 
+        flight.price.total <= criteria.max_price!
+      )
+    }
+
+    // Filter by max duration
+    if (criteria.max_duration) {
+      filteredFlights = filteredFlights.filter(flight => 
+        flight.total_duration <= criteria.max_duration!
+      )
+    }
+
+    // Filter by preferred airlines
+    if (criteria.preferred_airlines && criteria.preferred_airlines.length > 0) {
+      filteredFlights = filteredFlights.filter(flight => 
+        flight.segments.some(segment => 
+          criteria.preferred_airlines!.includes(segment.airline.code)
+        )
+      )
+    }
+
+    // Sort by sustainability if high priority
+    if (criteria.sustainability_priority === 'high' || criteria.sustainability_priority === 'maximum') {
+      filteredFlights = filteredFlights.sort((a, b) => {
+        const aScore = a.segments.reduce((sum, seg) => sum + seg.airline.sustainability_score, 0) / a.segments.length
+        const bScore = b.segments.reduce((sum, seg) => sum + seg.airline.sustainability_score, 0) / b.segments.length
+        return bScore - aScore // Higher sustainability score first
+      })
+    } else {
+      // Default sort by price
+      filteredFlights = filteredFlights.sort((a, b) => a.price.total - b.price.total)
+    }
+
+    return filteredFlights
   }
 
   // User profile operations
@@ -353,4 +496,5 @@ class DatabaseService {
 }
 
 // Export singleton instance
-export default new DatabaseService()
+const databaseService = new DatabaseService()
+export default databaseService

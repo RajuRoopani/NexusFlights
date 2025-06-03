@@ -20,7 +20,7 @@ export default function VoiceSearch({ onVoiceResult, onListening, className = ''
   useEffect(() => {
     // Check if speech recognition is supported
     if (typeof window !== 'undefined') {
-      const SpeechRecognition = window.SpeechRecognition || (window as any).webkitSpeechRecognition
+      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
       setIsSupported(!!SpeechRecognition)
 
       if (SpeechRecognition) {
